@@ -1,0 +1,1 @@
+{"functions":{"api/webhook.js":{"maxDuration":45}},"rewrites":[{"source":"/","destination":"/index.html"}]}
