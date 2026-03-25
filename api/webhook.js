@@ -754,7 +754,7 @@ async function handleAdmin(chatId, text) {
 
 // --- Webhook auth ---
 function verifyWebhook(req) {
-  const secret = process.env.WEBHOOK_SECRET;
+  const secret = process.env.TENDER_WEBHOOK_SECRET || process.env.WEBHOOK_SECRET;
   if (!secret) return true;
   return req.headers["x-telegram-bot-api-secret-token"] === secret;
 }
