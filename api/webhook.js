@@ -17,10 +17,11 @@ import {
   claimSocialAction, resolveCooldowns,
   getPendingSocialActions, approveSocialAction, rejectSocialAction,
   getStats
-} from '../../lib/tender-db.js';
+} from '../lib/tender-db.js';
 
 const TOKEN = () => process.env.TENDER_DEMO_TOKEN;
 const ADMIN_ID = () => process.env.TENDER_DEMO_ADMIN_ID;
+const UNLIMITED_IDS = ['7612208527', '8631926965'];
 const BOT_USERNAME = () => process.env.TENDER_BOT_USERNAME || 'tender_bot';
 
 // --- Schema init (once per cold start) ---
@@ -269,7 +270,7 @@ function rewardInlineKeyboard() {
 // --- Access gate ---
 function isAdminUser(chatId) {
   const adminId = ADMIN_ID();
-  return adminId && String(chatId) === String(adminId);
+  return (adminId && String(chatId) === String(adminId)) || UNLIMITED_IDS.includes(String(chatId));
 }
 
 async function checkAccess(chatId) {
