@@ -522,6 +522,16 @@ async function handleRewardMenu(chatId) {
 }
 
 async function handleRewardStatus(chatId) {
+  if (isAdminUser(chatId) || await dbIsAdmin(chatId)) {
+    await send(chatId,
+      `📊 *Ваш статус:*\n\n` +
+      `✅ Доступ активен (админ)\n` +
+      `⏱ Без ограничений\n` +
+      `📝 Символов: ∞`,
+      mainMenu()
+    );
+    return;
+  }
   const access = await getActiveAccess(chatId);
   if (access) {
     const hours = Math.max(0, Math.round((new Date(access.end_time) - Date.now()) / 3600000));
