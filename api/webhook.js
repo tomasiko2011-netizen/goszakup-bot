@@ -85,6 +85,9 @@ const ACTION_COST = {
   add_keyword: 20,
 };
 
+const LIVE_MODE = String(process.env.TENDER_LIVE || "").toLowerCase() === "true" || process.env.TENDER_LIVE === "1";
+const GQL_URL = process.env.GOSZAKUP_GQL_URL || "https://ows.goszakup.gov.kz/v2/graphql";
+
 // --- Mock tender data ---
 const MOCK_TENDERS = [
   {
@@ -151,6 +154,83 @@ const MOCK_TENDERS = [
     url: "https://goszakup.gov.kz/ru/announce/index/1007",
   },
 ];
+
+async function gqlRequest(query, variables = {}) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 12000);
+  try {
+    const res = await fetch(GQL_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ query, variables }),
+      signal: controller.signal,
+    });
+    const data = await res.json();
+    if (data?.errors) throw new Error(data.errors[0]?.message || "GraphQL error");
+    return data?.data;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function normalizeTrdBuy(t) {
+  return {
+    id: String(t.id || ""),
+    title: t.nameRu || t.nameKz || "Без названия",
+    amount: Number(t.totalSum || 0),
+    customer: t.customerNameRu || t.customerNameKz || "Заказчик не указан",
+    deadline: t.endDate || t.publishDate || "",
+    keywords: [],
+    url: t.id ? `https://goszakup.gov.kz/ru/announce/index/${t.id}` : "",
+  };
+}
+
+async function fetchLatestLive(limit = 5) {
+  const query = `
+    query LatestTrdBuy($limit: Int) {
+      TrdBuy(limit: $limit, after: 0) {
+        id
+        nameRu
+        nameKz
+        totalSum
+        customerNameRu
+        customerNameKz
+        publishDate
+        endDate
+      }
+    }
+  `;
+  const data = await gqlRequest(query, { limit });
+  const items = data?.TrdBuy || [];
+  return items.map(normalizeTrdBuy);
+}
+
+async function searchLiveByKeywords(keywords, limit = 10) {
+  const query = `
+    query SearchTrdBuy($q: String, $limit: Int) {
+      TrdBuy(limit: $limit, after: 0, filter: { nameRu: $q }) {
+        id
+        nameRu
+        nameKz
+        totalSum
+        customerNameRu
+        customerNameKz
+        publishDate
+        endDate
+      }
+    }
+  `;
+  const map = new Map();
+  for (const kw of keywords) {
+    const data = await gqlRequest(query, { q: kw, limit });
+    for (const item of data?.TrdBuy || []) {
+      if (!map.has(item.id)) {
+        map.set(item.id, normalizeTrdBuy(item));
+      }
+    }
+  }
+  return Array.from(map.values()).slice(0, limit);
+}
 
 // --- Telegram helpers ---
 async function tg(method, body) {
@@ -424,7 +504,17 @@ async function handleSearch(chatId) {
   }
 
   const results = searchTenders(kws);
-  if (results.length === 0) {
+  let liveResults = [];
+  if (LIVE_MODE) {
+    try {
+      const live = await searchLiveByKeywords(kws, 10);
+      liveResults = live.map(tender => ({ tender, matchedKeywords: kws }));
+    } catch (e) {
+      liveResults = [];
+    }
+  }
+  const finalResults = LIVE_MODE && liveResults.length > 0 ? liveResults : results;
+  if (finalResults.length === 0) {
     await deductChars(access.id, ACTION_COST.search, 'search', chatId);
     return send(chatId,
       `По вашим ключевым словам (${kws.join(", ")}) тендеров не найдено.\n\n` +
@@ -437,17 +527,17 @@ async function handleSearch(chatId) {
   const remaining = await getActiveAccess(chatId);
 
   await send(chatId,
-    `*Найдено ${results.length} тендеров* по словам: ${kws.join(", ")}\n` +
+    `*Найдено ${finalResults.length} тендеров* по словам: ${kws.join(", ")}\n` +
     (remaining ? `_Осталось символов: ${remaining.remaining_chars}_` : ''),
     mainMenu()
   );
 
-  for (const { tender, matchedKeywords } of results.slice(0, 5)) {
+  for (const { tender, matchedKeywords } of finalResults.slice(0, 5)) {
     await send(chatId, formatTender(tender, matchedKeywords));
   }
 
-  if (results.length > 5) {
-    await send(chatId, `...и ещё ${results.length - 5} тендеров. В полной версии — все результаты.`, mainMenu());
+  if (finalResults.length > 5) {
+    await send(chatId, `...и ещё ${finalResults.length - 5} тендеров. В полной версии — все результаты.`, mainMenu());
   }
 }
 
@@ -459,13 +549,23 @@ async function handleLatest(chatId) {
   await deductChars(access.id, ACTION_COST.latest, 'latest', chatId);
   await send(chatId, `*Последние тендеры на goszakup.gov.kz:*\n`, mainMenu());
 
-  for (const tender of MOCK_TENDERS.slice(0, 5)) {
+  let latest = [];
+  if (LIVE_MODE) {
+    try {
+      latest = await fetchLatestLive(5);
+    } catch (e) {
+      latest = MOCK_TENDERS.slice(0, 5);
+    }
+  } else {
+    latest = MOCK_TENDERS.slice(0, 5);
+  }
+  for (const tender of latest) {
     await send(chatId, formatTender(tender));
   }
 
   const remaining = await getActiveAccess(chatId);
   await send(chatId,
-    `_Показаны 5 из ${MOCK_TENDERS.length} тендеров._\n` +
+    `_Показаны ${latest.length} тендеров._\n` +
     (remaining ? `_Осталось символов: ${remaining.remaining_chars}_\n\n` : '\n') +
     `Добавьте ключевые слова для персонального мониторинга.`,
     mainMenu()
@@ -474,9 +574,10 @@ async function handleLatest(chatId) {
 
 async function handleAbout(chatId) {
   userStates.delete(chatId);
+  const dataLine = LIVE_MODE ? "Данные: goszakup.gov.kz (GraphQL API)" : "Данные: демо (mock)";
   await send(chatId,
     `*О боте мониторинга госзакупок*\n\n` +
-    `Данные: goszakup.gov.kz (GraphQL API)\n` +
+    `${dataLine}\n` +
     `Обновление: каждые 30 минут\n\n` +
     `*Полная версия включает:*\n` +
     `• Автоматические уведомления о новых тендерах\n` +
