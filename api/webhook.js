@@ -86,7 +86,8 @@ const ACTION_COST = {
 };
 
 const LIVE_MODE = String(process.env.TENDER_LIVE || "").toLowerCase() === "true" || process.env.TENDER_LIVE === "1";
-const GQL_URL = process.env.GOSZAKUP_GQL_URL || "https://ows.goszakup.gov.kz/v2/graphql";
+const GQL_URL = process.env.GOSZAKUP_GQL_URL || "https://ows.goszakup.gov.kz/v3/graphql";
+const GQL_TOKEN = process.env.TENDER_GQL_TOKEN || "";
 
 // --- Mock tender data ---
 const MOCK_TENDERS = [
@@ -156,12 +157,16 @@ const MOCK_TENDERS = [
 ];
 
 async function gqlRequest(query, variables = {}) {
+  if (!GQL_TOKEN) throw new Error("missing_token");
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 12000);
   try {
     const res = await fetch(GQL_URL, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        ...(GQL_TOKEN ? { Authorization: `Bearer ${GQL_TOKEN}` } : {}),
+      },
       body: JSON.stringify({ query, variables }),
       signal: controller.signal,
     });
@@ -186,7 +191,7 @@ function normalizeTrdBuy(t) {
 }
 
 async function fetchLatestLive(limit = 5) {
-  const query = `
+  const queryCamel = `
     query LatestTrdBuy($limit: Int) {
       TrdBuy(limit: $limit, after: 0) {
         id
@@ -200,13 +205,42 @@ async function fetchLatestLive(limit = 5) {
       }
     }
   `;
-  const data = await gqlRequest(query, { limit });
-  const items = data?.TrdBuy || [];
-  return items.map(normalizeTrdBuy);
+  const querySnake = `
+    query LatestTrdBuy($limit: Int) {
+      trd_buy(limit: $limit, after: 0) {
+        id
+        name_ru
+        name_kz
+        total_sum
+        customer_name_ru
+        customer_name_kz
+        publish_date
+        end_date
+      }
+    }
+  `;
+  try {
+    const data = await gqlRequest(queryCamel, { limit });
+    const items = data?.TrdBuy || [];
+    return items.map(normalizeTrdBuy);
+  } catch (e) {
+    const data = await gqlRequest(querySnake, { limit });
+    const items = data?.trd_buy || [];
+    return items.map(t => normalizeTrdBuy({
+      id: t.id,
+      nameRu: t.name_ru,
+      nameKz: t.name_kz,
+      totalSum: t.total_sum,
+      customerNameRu: t.customer_name_ru,
+      customerNameKz: t.customer_name_kz,
+      publishDate: t.publish_date,
+      endDate: t.end_date,
+    }));
+  }
 }
 
 async function searchLiveByKeywords(keywords, limit = 10) {
-  const query = `
+  const queryCamel = `
     query SearchTrdBuy($q: String, $limit: Int) {
       TrdBuy(limit: $limit, after: 0, filter: { nameRu: $q }) {
         id
@@ -220,12 +254,45 @@ async function searchLiveByKeywords(keywords, limit = 10) {
       }
     }
   `;
+  const querySnake = `
+    query SearchTrdBuy($q: String, $limit: Int) {
+      trd_buy(limit: $limit, after: 0, filters: { name_ru: $q }) {
+        id
+        name_ru
+        name_kz
+        total_sum
+        customer_name_ru
+        customer_name_kz
+        publish_date
+        end_date
+      }
+    }
+  `;
   const map = new Map();
   for (const kw of keywords) {
-    const data = await gqlRequest(query, { q: kw, limit });
-    for (const item of data?.TrdBuy || []) {
-      if (!map.has(item.id)) {
-        map.set(item.id, normalizeTrdBuy(item));
+    try {
+      const data = await gqlRequest(queryCamel, { q: kw, limit });
+      for (const item of data?.TrdBuy || []) {
+        if (!map.has(item.id)) {
+          map.set(item.id, normalizeTrdBuy(item));
+        }
+      }
+    } catch (e) {
+      const data = await gqlRequest(querySnake, { q: kw, limit });
+      for (const t of data?.trd_buy || []) {
+        const item = normalizeTrdBuy({
+          id: t.id,
+          nameRu: t.name_ru,
+          nameKz: t.name_kz,
+          totalSum: t.total_sum,
+          customerNameRu: t.customer_name_ru,
+          customerNameKz: t.customer_name_kz,
+          publishDate: t.publish_date,
+          endDate: t.end_date,
+        });
+        if (!map.has(item.id)) {
+          map.set(item.id, item);
+        }
       }
     }
   }
@@ -505,11 +572,13 @@ async function handleSearch(chatId) {
 
   const results = searchTenders(kws);
   let liveResults = [];
+  let liveFailed = false;
   if (LIVE_MODE) {
     try {
       const live = await searchLiveByKeywords(kws, 10);
       liveResults = live.map(tender => ({ tender, matchedKeywords: kws }));
     } catch (e) {
+      liveFailed = true;
       liveResults = [];
     }
   }
@@ -518,6 +587,7 @@ async function handleSearch(chatId) {
     await deductChars(access.id, ACTION_COST.search, 'search', chatId);
     return send(chatId,
       `По вашим ключевым словам (${kws.join(", ")}) тендеров не найдено.\n\n` +
+      `${liveFailed || !GQL_TOKEN ? "Live API недоступен, показаны демо‑данные.\n\n" : ""}` +
       `Попробуйте добавить другие слова.`,
       mainMenu()
     );
@@ -528,7 +598,8 @@ async function handleSearch(chatId) {
 
   await send(chatId,
     `*Найдено ${finalResults.length} тендеров* по словам: ${kws.join(", ")}\n` +
-    (remaining ? `_Осталось символов: ${remaining.remaining_chars}_` : ''),
+    (remaining ? `_Осталось символов: ${remaining.remaining_chars}_` : '') +
+    `${liveFailed || !GQL_TOKEN ? `\n_Live API недоступен, показаны демо‑данные._` : ""}`,
     mainMenu()
   );
 
@@ -550,10 +621,12 @@ async function handleLatest(chatId) {
   await send(chatId, `*Последние тендеры на goszakup.gov.kz:*\n`, mainMenu());
 
   let latest = [];
+  let liveFailed = false;
   if (LIVE_MODE) {
     try {
       latest = await fetchLatestLive(5);
     } catch (e) {
+      liveFailed = true;
       latest = MOCK_TENDERS.slice(0, 5);
     }
   } else {
@@ -567,6 +640,7 @@ async function handleLatest(chatId) {
   await send(chatId,
     `_Показаны ${latest.length} тендеров._\n` +
     (remaining ? `_Осталось символов: ${remaining.remaining_chars}_\n\n` : '\n') +
+    `${liveFailed || !GQL_TOKEN ? `_Live API недоступен, показаны демо‑данные._\n\n` : ''}` +
     `Добавьте ключевые слова для персонального мониторинга.`,
     mainMenu()
   );
