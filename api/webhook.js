@@ -21,7 +21,7 @@ import {
 
 const TOKEN = () => process.env.TENDER_DEMO_TOKEN;
 const ADMIN_ID = () => process.env.TENDER_DEMO_ADMIN_ID;
-const UNLIMITED_IDS = ['7612208527', '8631926965'];
+const UNLIMITED_IDS = ['7612208527', '8631926965', '454779102'];
 const BOT_USERNAME = () => process.env.TENDER_BOT_USERNAME || 'tender_bot';
 
 // --- Schema init (once per cold start) ---
