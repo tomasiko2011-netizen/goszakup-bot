@@ -239,10 +239,10 @@ async function fetchLatestLive(limit = 5) {
   }
 }
 
-async function searchLiveByKeywords(keywords, limit = 10) {
-  const queryCamel = `
+function buildCamelQuery(filterField) {
+  return `
     query SearchTrdBuy($q: String, $limit: Int) {
-      TrdBuy(limit: $limit, after: 0, filter: { nameRu: $q }) {
+      TrdBuy(limit: $limit, after: 0, filter: { ${filterField}: $q }) {
         id
         nameRu
         nameKz
@@ -254,9 +254,12 @@ async function searchLiveByKeywords(keywords, limit = 10) {
       }
     }
   `;
-  const querySnake = `
+}
+
+function buildSnakeQuery(filterField) {
+  return `
     query SearchTrdBuy($q: String, $limit: Int) {
-      trd_buy(limit: $limit, after: 0, filters: { name_ru: $q }) {
+      trd_buy(limit: $limit, after: 0, filters: { ${filterField}: $q }) {
         id
         name_ru
         name_kz
@@ -268,35 +271,83 @@ async function searchLiveByKeywords(keywords, limit = 10) {
       }
     }
   `;
-  const map = new Map();
-  for (const kw of keywords) {
+}
+
+function mapSnakeTender(t) {
+  return normalizeTrdBuy({
+    id: t.id,
+    nameRu: t.name_ru,
+    nameKz: t.name_kz,
+    totalSum: t.total_sum,
+    customerNameRu: t.customer_name_ru,
+    customerNameKz: t.customer_name_kz,
+    publishDate: t.publish_date,
+    endDate: t.end_date,
+  });
+}
+
+async function fetchByKeyword(kw, perKwLimit) {
+  // Try substring filter (nameDescriptionRu) first, then exact (nameRu),
+  // each with camelCase + snake_case fallback. Return raw matches; caller verifies.
+  const attempts = [
+    { query: buildCamelQuery('nameDescriptionRu'), root: 'TrdBuy', snake: false },
+    { query: buildCamelQuery('nameRu'),            root: 'TrdBuy', snake: false },
+    { query: buildSnakeQuery('name_description_ru'), root: 'trd_buy', snake: true },
+    { query: buildSnakeQuery('name_ru'),             root: 'trd_buy', snake: true },
+  ];
+  for (const a of attempts) {
     try {
-      const data = await gqlRequest(queryCamel, { q: kw, limit });
-      for (const item of data?.TrdBuy || []) {
-        if (!map.has(item.id)) {
-          map.set(item.id, normalizeTrdBuy(item));
-        }
-      }
-    } catch (e) {
-      const data = await gqlRequest(querySnake, { q: kw, limit });
-      for (const t of data?.trd_buy || []) {
-        const item = normalizeTrdBuy({
-          id: t.id,
-          nameRu: t.name_ru,
-          nameKz: t.name_kz,
-          totalSum: t.total_sum,
-          customerNameRu: t.customer_name_ru,
-          customerNameKz: t.customer_name_kz,
-          publishDate: t.publish_date,
-          endDate: t.end_date,
-        });
-        if (!map.has(item.id)) {
-          map.set(item.id, item);
-        }
+      const data = await gqlRequest(a.query, { q: kw, limit: perKwLimit });
+      const items = data?.[a.root] || [];
+      if (items.length === 0) continue;
+      return a.snake ? items.map(mapSnakeTender) : items.map(normalizeTrdBuy);
+    } catch (_) {
+      continue;
+    }
+  }
+  return [];
+}
+
+async function searchLiveByKeywords(keywords, limit = 10) {
+  // Server-side filter per keyword in parallel, dedupe by id, local substring
+  // verification, graceful per-keyword failure, real matchedKeywords tracking.
+  const normKeywords = keywords
+    .map(k => String(k || "").toLowerCase().trim())
+    .filter(Boolean);
+  if (normKeywords.length === 0) return [];
+
+  const perKwLimit = Math.max(20, Math.min(50, limit * 5));
+  const byId = new Map(); // id -> { tender, matchedKeywords: Set<string> }
+  let anySucceeded = false;
+
+  const results = await Promise.allSettled(
+    normKeywords.map(kw => fetchByKeyword(kw, perKwLimit).then(items => ({ kw, items })))
+  );
+
+  for (const r of results) {
+    if (r.status !== 'fulfilled') continue;
+    anySucceeded = true;
+    const { kw, items } = r.value;
+    for (const tender of items) {
+      const hay = `${tender.title || ""} ${tender.customer || ""}`.toLowerCase();
+      if (!hay.includes(kw)) continue; // discard false positives
+      const existing = byId.get(tender.id);
+      if (existing) {
+        existing.matchedKeywords.add(kw);
+      } else {
+        byId.set(tender.id, { tender, matchedKeywords: new Set([kw]) });
       }
     }
   }
-  return Array.from(map.values()).slice(0, limit);
+
+  if (!anySucceeded) throw new Error("all_keyword_queries_failed");
+
+  return Array.from(byId.values())
+    .slice(0, limit)
+    .map(({ tender, matchedKeywords }) => ({
+      tender,
+      matchedKeywords: Array.from(matchedKeywords),
+    }));
 }
 
 // --- Telegram helpers ---
@@ -575,8 +626,7 @@ async function handleSearch(chatId) {
   let liveFailed = false;
   if (LIVE_MODE) {
     try {
-      const live = await searchLiveByKeywords(kws, 10);
-      liveResults = live.map(tender => ({ tender, matchedKeywords: kws }));
+      liveResults = await searchLiveByKeywords(kws, 10);
     } catch (e) {
       liveFailed = true;
       liveResults = [];
