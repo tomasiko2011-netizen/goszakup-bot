@@ -1,6 +1,6 @@
 /**
  * Vercel serverless webhook — Tender Monitor Bot
- * Мониторинг госзакупок goszakup.gov.kz — демо с mock данными
+ * Мониторинг госзакупок goszakup.gov.kz — production/live
  * Reward-система: доступ через задания (подписка, соцсети, рефералы)
  *
  * Env vars:
@@ -76,6 +76,7 @@ function removeKeywordFromList(chatId, keyword) {
 
 // --- User state (waiting for keyword input, admin input, etc.) ---
 const userStates = new Map();
+const userFilters = new Map();
 
 // --- Action costs (chars) ---
 const ACTION_COST = {
@@ -85,7 +86,7 @@ const ACTION_COST = {
   add_keyword: 20,
 };
 
-const LIVE_MODE = String(process.env.TENDER_LIVE || "").toLowerCase() === "true" || process.env.TENDER_LIVE === "1";
+const LIVE_MODE = true;
 const GQL_URL = process.env.GOSZAKUP_GQL_URL || "https://ows.goszakup.gov.kz/v3/graphql";
 const GQL_TOKEN = process.env.TENDER_GQL_TOKEN || "";
 
@@ -179,12 +180,22 @@ async function gqlRequest(query, variables = {}) {
 }
 
 function normalizeTrdBuy(t) {
+  const customerName =
+    t.customerNameRu ||
+    t.customerNameKz ||
+    t.orgNameRu ||
+    t.orgNameKz ||
+    "Заказчик не указан";
+  const customerBin = t.customerBin || t.orgBin || "";
   return {
     id: String(t.id || ""),
     title: t.nameRu || t.nameKz || "Без названия",
     amount: Number(t.totalSum || 0),
-    customer: t.customerNameRu || t.customerNameKz || "Заказчик не указан",
+    customer: customerBin ? `${customerName} (БИН: ${customerBin})` : customerName,
     deadline: t.endDate || t.publishDate || "",
+    startDate: t.startDate || "",
+    publishDate: t.publishDate || "",
+    kato: t.kato || "",
     keywords: [],
     url: t.id ? `https://goszakup.gov.kz/ru/announce/index/${t.id}` : "",
   };
@@ -198,8 +209,14 @@ async function fetchLatestLive(limit = 5) {
         nameRu
         nameKz
         totalSum
+        startDate
         customerNameRu
         customerNameKz
+        customerBin
+        orgNameRu
+        orgNameKz
+        orgBin
+        kato
         publishDate
         endDate
       }
@@ -212,8 +229,14 @@ async function fetchLatestLive(limit = 5) {
         name_ru
         name_kz
         total_sum
+        start_date
         customer_name_ru
         customer_name_kz
+        customer_bin
+        org_name_ru
+        org_name_kz
+        org_bin
+        kato
         publish_date
         end_date
       }
@@ -231,8 +254,14 @@ async function fetchLatestLive(limit = 5) {
       nameRu: t.name_ru,
       nameKz: t.name_kz,
       totalSum: t.total_sum,
+      startDate: t.start_date,
       customerNameRu: t.customer_name_ru,
       customerNameKz: t.customer_name_kz,
+      customerBin: t.customer_bin,
+      orgNameRu: t.org_name_ru,
+      orgNameKz: t.org_name_kz,
+      orgBin: t.org_bin,
+      kato: t.kato,
       publishDate: t.publish_date,
       endDate: t.end_date,
     }));
@@ -247,8 +276,14 @@ function buildCamelQuery(filterField) {
         nameRu
         nameKz
         totalSum
+        startDate
         customerNameRu
         customerNameKz
+        customerBin
+        orgNameRu
+        orgNameKz
+        orgBin
+        kato
         publishDate
         endDate
       }
@@ -264,8 +299,14 @@ function buildSnakeQuery(filterField) {
         name_ru
         name_kz
         total_sum
+        start_date
         customer_name_ru
         customer_name_kz
+        customer_bin
+        org_name_ru
+        org_name_kz
+        org_bin
+        kato
         publish_date
         end_date
       }
@@ -279,8 +320,14 @@ function mapSnakeTender(t) {
     nameRu: t.name_ru,
     nameKz: t.name_kz,
     totalSum: t.total_sum,
+    startDate: t.start_date,
     customerNameRu: t.customer_name_ru,
     customerNameKz: t.customer_name_kz,
+    customerBin: t.customer_bin,
+    orgNameRu: t.org_name_ru,
+    orgNameKz: t.org_name_kz,
+    orgBin: t.org_bin,
+    kato: t.kato,
     publishDate: t.publish_date,
     endDate: t.end_date,
   });
@@ -309,14 +356,14 @@ async function fetchByKeyword(kw, perKwLimit) {
 }
 
 async function searchLiveByKeywords(keywords, limit = 10) {
-  // Server-side filter per keyword in parallel, dedupe by id, local substring
-  // verification, graceful per-keyword failure, real matchedKeywords tracking.
+  // Server-side filter per keyword (parallel), merge by tender id,
+  // verify locally (substring), graceful failure per keyword.
   const normKeywords = keywords
     .map(k => String(k || "").toLowerCase().trim())
     .filter(Boolean);
   if (normKeywords.length === 0) return [];
 
-  const perKwLimit = Math.max(20, Math.min(50, limit * 5));
+  const perKwLimit = Math.max(10, Math.min(50, limit * 5));
   const byId = new Map(); // id -> { tender, matchedKeywords: Set<string> }
   let anySucceeded = false;
 
@@ -330,7 +377,7 @@ async function searchLiveByKeywords(keywords, limit = 10) {
     const { kw, items } = r.value;
     for (const tender of items) {
       const hay = `${tender.title || ""} ${tender.customer || ""}`.toLowerCase();
-      if (!hay.includes(kw)) continue; // discard false positives
+      if (!hay.includes(kw)) continue; // local verification
       const existing = byId.get(tender.id);
       if (existing) {
         existing.matchedKeywords.add(kw);
@@ -431,12 +478,103 @@ function mainMenu() {
       keyboard: [
         [{ text: "🔍 Найти тендеры" }, { text: "📋 Последние тендеры" }],
         [{ text: "🔑 Мои ключевые слова" }, { text: "➕ Добавить слово" }],
+        [{ text: "⚙️ Фильтры" }],
         [{ text: "🎁 Получить доступ" }, { text: "📊 Мой статус" }],
         [{ text: "ℹ️ О боте" }],
       ],
       resize_keyboard: true,
     },
   };
+}
+
+function getFilters(chatId) {
+  return userFilters.get(chatId) || {};
+}
+
+function parseDateSafe(s) {
+  if (!s) return null;
+  const d = new Date(String(s).replace(" ", "T"));
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
+function applyTenderFilters(items, filters) {
+  if (!filters || Object.keys(filters).length === 0) return items;
+  return items.filter(({ tender }) => {
+    if (filters.minSum != null && Number(tender.amount || 0) < filters.minSum) return false;
+    if (filters.maxSum != null && Number(tender.amount || 0) > filters.maxSum) return false;
+
+    if (filters.deadlineDays != null) {
+      const end = parseDateSafe(tender.deadline);
+      if (!end) return false;
+      const diffDays = (end.getTime() - Date.now()) / 86400000;
+      if (diffDays < 0 || diffDays > filters.deadlineDays) return false;
+    }
+
+    if (filters.region) {
+      const rg = String(filters.region).toLowerCase().trim();
+      const hay = `${tender.title || ""} ${tender.customer || ""} ${tender.kato || ""}`.toLowerCase();
+      if (!hay.includes(rg)) return false;
+    }
+
+    return true;
+  });
+}
+
+async function handleFilters(chatId) {
+  const f = getFilters(chatId);
+  userStates.set(chatId, { state: "waiting_filter_input" });
+  await send(
+    chatId,
+    `*Текущие фильтры:*\n` +
+      `• Регион: ${f.region || "не задан"}\n` +
+      `• Бюджет: ${f.minSum ?? "-"} — ${f.maxSum ?? "-"} ₸\n` +
+      `• Дедлайн: ${f.deadlineDays ?? "-"} дней\n\n` +
+      `Отправьте одной строкой:\n` +
+      `• \`регион: алматы\`\n` +
+      `• \`бюджет: 100000-5000000\`\n` +
+      `• \`дедлайн: 7\`\n` +
+      `• \`сброс\``,
+    mainMenu()
+  );
+}
+
+async function handleFilterInput(chatId, text) {
+  const raw = String(text || "").trim();
+  const lower = raw.toLowerCase();
+  const f = { ...getFilters(chatId) };
+
+  if (lower === "сброс" || lower === "clear") {
+    userFilters.delete(chatId);
+    userStates.delete(chatId);
+    return send(chatId, `✅ Фильтры сброшены.`, mainMenu());
+  }
+
+  if (lower.startsWith("регион:")) {
+    f.region = raw.split(":").slice(1).join(":").trim();
+  } else if (lower.startsWith("бюджет:")) {
+    const val = raw.split(":").slice(1).join(":").trim();
+    const m = val.match(/^(\d+)\s*-\s*(\d+)$/);
+    if (!m) return send(chatId, `Формат бюджета: бюджет: 100000-5000000`, mainMenu());
+    f.minSum = Number(m[1]);
+    f.maxSum = Number(m[2]);
+  } else if (lower.startsWith("дедлайн:")) {
+    const val = Number(raw.split(":").slice(1).join(":").trim());
+    if (!Number.isFinite(val) || val <= 0) return send(chatId, `Формат дедлайна: дедлайн: 7`, mainMenu());
+    f.deadlineDays = Math.floor(val);
+  } else {
+    return send(chatId, `Не понял. Используйте: регион:, бюджет:, дедлайн: или сброс`, mainMenu());
+  }
+
+  userFilters.set(chatId, f);
+  userStates.delete(chatId);
+  return send(
+    chatId,
+    `✅ Фильтр сохранён.\n` +
+      `• Регион: ${f.region || "не задан"}\n` +
+      `• Бюджет: ${f.minSum ?? "-"} — ${f.maxSum ?? "-"} ₸\n` +
+      `• Дедлайн: ${f.deadlineDays ?? "-"} дней`,
+    mainMenu()
+  );
 }
 
 function rewardMenu() {
@@ -537,7 +675,7 @@ async function handleStart(chatId, from, startParam) {
     `• Мониторинг новых закупок\n` +
     `• Уведомления о подходящих тендерах\n\n` +
     (granted
-      ? `*Начните с добавления ключевых слов* — нажмите "➕ Добавить слово"\n\n_Демо-версия с примерами тендеров_`
+      ? `*Начните с добавления ключевых слов* — нажмите "➕ Добавить слово"`
       : `🎁 *Выполните задание* для получения бесплатного доступа:`),
     granted ? menu : { ...menu, ...rewardInlineKeyboard() }
   );
@@ -625,6 +763,9 @@ async function handleSearch(chatId) {
   let liveResults = [];
   let liveFailed = false;
   if (LIVE_MODE) {
+    if (!GQL_TOKEN) {
+      return send(chatId, `❌ Live-режим включён, но не настроен TENDER_GQL_TOKEN. Обратитесь к администратору.`, mainMenu());
+    }
     try {
       liveResults = await searchLiveByKeywords(kws, 10);
     } catch (e) {
@@ -632,12 +773,14 @@ async function handleSearch(chatId) {
       liveResults = [];
     }
   }
-  const finalResults = LIVE_MODE && liveResults.length > 0 ? liveResults : results;
+  if (LIVE_MODE && liveFailed) {
+    return send(chatId, `❌ Временная ошибка live API госзакуп. Повторите через 1-2 минуты.`, mainMenu());
+  }
+  const finalResults = applyTenderFilters(LIVE_MODE ? liveResults : results, getFilters(chatId));
   if (finalResults.length === 0) {
     await deductChars(access.id, ACTION_COST.search, 'search', chatId);
     return send(chatId,
       `По вашим ключевым словам (${kws.join(", ")}) тендеров не найдено.\n\n` +
-      `${liveFailed || !GQL_TOKEN ? "Live API недоступен, показаны демо‑данные.\n\n" : ""}` +
       `Попробуйте добавить другие слова.`,
       mainMenu()
     );
@@ -648,8 +791,7 @@ async function handleSearch(chatId) {
 
   await send(chatId,
     `*Найдено ${finalResults.length} тендеров* по словам: ${kws.join(", ")}\n` +
-    (remaining ? `_Осталось символов: ${remaining.remaining_chars}_` : '') +
-    `${liveFailed || !GQL_TOKEN ? `\n_Live API недоступен, показаны демо‑данные._` : ""}`,
+    (remaining ? `_Осталось символов: ${remaining.remaining_chars}_` : ''),
     mainMenu()
   );
 
@@ -671,26 +813,27 @@ async function handleLatest(chatId) {
   await send(chatId, `*Последние тендеры на goszakup.gov.kz:*\n`, mainMenu());
 
   let latest = [];
-  let liveFailed = false;
   if (LIVE_MODE) {
+    if (!GQL_TOKEN) {
+      return send(chatId, `❌ Live-режим включён, но не настроен TENDER_GQL_TOKEN. Обратитесь к администратору.`, mainMenu());
+    }
     try {
       latest = await fetchLatestLive(5);
     } catch (e) {
-      liveFailed = true;
-      latest = MOCK_TENDERS.slice(0, 5);
+      return send(chatId, `❌ Временная ошибка live API госзакуп. Повторите через 1-2 минуты.`, mainMenu());
     }
   } else {
     latest = MOCK_TENDERS.slice(0, 5);
   }
-  for (const tender of latest) {
+  const filteredLatest = applyTenderFilters(latest.map(t => ({ tender: t, matchedKeywords: [] })), getFilters(chatId)).map(r => r.tender);
+  for (const tender of filteredLatest) {
     await send(chatId, formatTender(tender));
   }
 
   const remaining = await getActiveAccess(chatId);
   await send(chatId,
-    `_Показаны ${latest.length} тендеров._\n` +
+    `_Показаны ${filteredLatest.length} тендеров._\n` +
     (remaining ? `_Осталось символов: ${remaining.remaining_chars}_\n\n` : '\n') +
-    `${liveFailed || !GQL_TOKEN ? `_Live API недоступен, показаны демо‑данные._\n\n` : ''}` +
     `Добавьте ключевые слова для персонального мониторинга.`,
     mainMenu()
   );
@@ -699,6 +842,7 @@ async function handleLatest(chatId) {
 async function handleAbout(chatId) {
   userStates.delete(chatId);
   const dataLine = LIVE_MODE ? "Данные: goszakup.gov.kz (GraphQL API)" : "Данные: демо (mock)";
+  const demoNote = LIVE_MODE ? "" : `_Это демо-версия с примерами данных._\n\n`;
   await send(chatId,
     `*О боте мониторинга госзакупок*\n\n` +
     `${dataLine}\n` +
@@ -709,7 +853,7 @@ async function handleAbout(chatId) {
     `• Аналитика по заказчикам\n` +
     `• Экспорт в Excel\n` +
     `• История тендеров\n\n` +
-    `_Это демо-версия с примерами данных._\n\n` +
+    `${demoNote}` +
     `По вопросам: @monkeybot\\_support`,
     mainMenu()
   );
@@ -1079,6 +1223,10 @@ export default async function handler(req, res) {
       await handleKeywordInput(chatId, text);
       return res.status(200).json({ ok: true });
     }
+    if (currentState?.state === "waiting_filter_input" && !text.startsWith("/")) {
+      await handleFilterInput(chatId, text);
+      return res.status(200).json({ ok: true });
+    }
     // Legacy state format support
     if (currentState === "waiting_keyword" && !text.startsWith("/")) {
       await handleKeywordInput(chatId, text);
@@ -1107,6 +1255,8 @@ export default async function handler(req, res) {
       await handleMyKeywords(chatId);
     } else if (text === "➕ Добавить слово" || text === "/add") {
       await handleAddKeyword(chatId);
+    } else if (text === "⚙️ Фильтры" || text === "/filters") {
+      await handleFilters(chatId);
     } else if (text === "🎁 Получить доступ" || text === "/reward") {
       await handleRewardMenu(chatId);
     } else if (text === "📊 Мой статус" || text === "/status") {
