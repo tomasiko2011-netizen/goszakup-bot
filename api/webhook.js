@@ -27,12 +27,11 @@ const _envTrim = (k, fallback = '') => (process.env[k] || fallback).trim();
 const TOKEN = () => _envTrim('TENDER_DEMO_TOKEN');
 const ADMIN_ID = () => _envTrim('TENDER_DEMO_ADMIN_ID');
 const UNLIMITED_IDS = [
-  '7612208527',
-  '8631926965',  // Гульдана (owner)
-  '454779102',
-  '748220848',   // Адильбек
-  '8468989023',
-  '5584730486',  // Айдар
+  '8631926965',  // Гульдана (owner, @BotJasau)
+  '8468989023',  // Гульдана alt (@NewQaz)
+  '454779102',   // Muhammad
+  '748220848',   // Адильбек (@Deko_mirror)
+  '5584730486',  // Айдар (@KZ888ADR08)
 ];
 const BOT_USERNAME = () => _envTrim('TENDER_BOT_USERNAME', 'tender_bot');
 
