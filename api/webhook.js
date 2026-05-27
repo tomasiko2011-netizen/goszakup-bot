@@ -21,10 +21,13 @@ import {
   getUserFilters, setUserFilters, clearUserFilters
 } from '../lib/tender-db.js';
 
-const TOKEN = () => process.env.TENDER_DEMO_TOKEN;
-const ADMIN_ID = () => process.env.TENDER_DEMO_ADMIN_ID;
+// All env reads use .trim() — prod env-vars were saved with literal "\n"
+// via vercel CLI echo, which silently breaks API calls and webhook secrets.
+const _envTrim = (k, fallback = '') => (process.env[k] || fallback).trim();
+const TOKEN = () => _envTrim('TENDER_DEMO_TOKEN');
+const ADMIN_ID = () => _envTrim('TENDER_DEMO_ADMIN_ID');
 const UNLIMITED_IDS = ['7612208527', '8631926965', '454779102', '748220848', '8468989023'];
-const BOT_USERNAME = () => process.env.TENDER_BOT_USERNAME || 'tender_bot';
+const BOT_USERNAME = () => _envTrim('TENDER_BOT_USERNAME', 'tender_bot');
 
 // --- Schema init (once per cold start) ---
 let schemaReady = false;
@@ -78,8 +81,12 @@ const ACTION_COST = {
 };
 
 const LIVE_MODE = true;
-const GQL_URL = process.env.GOSZAKUP_GQL_URL || "https://ows.goszakup.gov.kz/v3/graphql";
-const GQL_TOKEN = process.env.TENDER_GQL_TOKEN || "";
+// Hardcode URL: prod env-var was saved with literal "\n" via vercel CLI echo,
+// breaking fetch (404 "Unable to resolve v3/graphql\n"). Avoid env entirely.
+const GQL_URL = "https://ows.goszakup.gov.kz/v3/graphql";
+// Trim token: same env CLI bug can leave "\n" or whitespace at the end,
+// which breaks the Authorization header.
+const GQL_TOKEN = (process.env.TENDER_GQL_TOKEN || "").trim();
 
 // --- Mock tender data ---
 const MOCK_TENDERS = [
@@ -1124,7 +1131,7 @@ async function handleAdmin(chatId, text) {
 
 // --- Webhook auth ---
 function verifyWebhook(req) {
-  const secret = process.env.TENDER_WEBHOOK_SECRET || process.env.WEBHOOK_SECRET;
+  const secret = (process.env.TENDER_WEBHOOK_SECRET || process.env.WEBHOOK_SECRET || '').trim();
   if (!secret) return true;
   return req.headers["x-telegram-bot-api-secret-token"] === secret;
 }
