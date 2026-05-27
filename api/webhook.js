@@ -26,7 +26,14 @@ import {
 const _envTrim = (k, fallback = '') => (process.env[k] || fallback).trim();
 const TOKEN = () => _envTrim('TENDER_DEMO_TOKEN');
 const ADMIN_ID = () => _envTrim('TENDER_DEMO_ADMIN_ID');
-const UNLIMITED_IDS = ['7612208527', '8631926965', '454779102', '748220848', '8468989023'];
+const UNLIMITED_IDS = [
+  '7612208527',
+  '8631926965',  // Гульдана (owner)
+  '454779102',
+  '748220848',   // Адильбек
+  '8468989023',
+  '5584730486',  // Айдар
+];
 const BOT_USERNAME = () => _envTrim('TENDER_BOT_USERNAME', 'tender_bot');
 
 // --- Schema init (once per cold start) ---
