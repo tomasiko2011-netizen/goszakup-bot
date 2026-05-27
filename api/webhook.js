@@ -16,7 +16,9 @@ import {
   recordReferral, getReferralCount, grantReferralAccess,
   claimSocialAction, resolveCooldowns,
   getPendingSocialActions, approveSocialAction, rejectSocialAction,
-  getStats
+  getStats,
+  getUserKeywords, addUserKeyword, removeUserKeyword,
+  getUserFilters, setUserFilters, clearUserFilters
 } from '../lib/tender-db.js';
 
 const TOKEN = () => process.env.TENDER_DEMO_TOKEN;
@@ -49,34 +51,23 @@ function checkRateLimit(chatId) {
   return entry.count <= 10;
 }
 
-// --- User keywords storage (in-memory, per serverless instance) ---
-const userKeywords = new Map();
-
-function getKeywords(chatId) {
-  return userKeywords.get(chatId) || [];
+// --- User keywords (persisted in Neon — survive Vercel cold starts) ---
+async function getKeywords(chatId) {
+  return getUserKeywords(chatId);
 }
 
-function addKeywordToList(chatId, keyword) {
-  const kws = getKeywords(chatId);
+async function addKeywordToList(chatId, keyword) {
   const normalized = keyword.toLowerCase().trim();
-  if (kws.includes(normalized)) return false;
-  kws.push(normalized);
-  userKeywords.set(chatId, kws);
-  return true;
+  return addUserKeyword(chatId, normalized);
 }
 
-function removeKeywordFromList(chatId, keyword) {
-  const kws = getKeywords(chatId);
-  const idx = kws.indexOf(keyword.toLowerCase().trim());
-  if (idx === -1) return false;
-  kws.splice(idx, 1);
-  userKeywords.set(chatId, kws);
-  return true;
+async function removeKeywordFromList(chatId, keyword) {
+  return removeUserKeyword(chatId, keyword.toLowerCase().trim());
 }
 
 // --- User state (waiting for keyword input, admin input, etc.) ---
+// In-memory: ephemeral conversational state, OK to lose on cold start
 const userStates = new Map();
-const userFilters = new Map();
 
 // --- Action costs (chars) ---
 const ACTION_COST = {
@@ -487,8 +478,8 @@ function mainMenu() {
   };
 }
 
-function getFilters(chatId) {
-  return userFilters.get(chatId) || {};
+async function getFilters(chatId) {
+  return getUserFilters(chatId);
 }
 
 function parseDateSafe(s) {
@@ -521,7 +512,7 @@ function applyTenderFilters(items, filters) {
 }
 
 async function handleFilters(chatId) {
-  const f = getFilters(chatId);
+  const f = await getFilters(chatId);
   userStates.set(chatId, { state: "waiting_filter_input" });
   await send(
     chatId,
@@ -541,10 +532,10 @@ async function handleFilters(chatId) {
 async function handleFilterInput(chatId, text) {
   const raw = String(text || "").trim();
   const lower = raw.toLowerCase();
-  const f = { ...getFilters(chatId) };
+  const f = { ...(await getFilters(chatId)) };
 
   if (lower === "сброс" || lower === "clear") {
-    userFilters.delete(chatId);
+    await clearUserFilters(chatId);
     userStates.delete(chatId);
     return send(chatId, `✅ Фильтры сброшены.`, mainMenu());
   }
@@ -565,7 +556,7 @@ async function handleFilterInput(chatId, text) {
     return send(chatId, `Не понял. Используйте: регион:, бюджет:, дедлайн: или сброс`, mainMenu());
   }
 
-  userFilters.set(chatId, f);
+  await setUserFilters(chatId, f);
   userStates.delete(chatId);
   return send(
     chatId,
@@ -688,7 +679,7 @@ async function handleMyKeywords(chatId) {
   const access = await requireAccess(chatId, 'keywords');
   if (!access) return;
 
-  const kws = getKeywords(chatId);
+  const kws = await getKeywords(chatId);
   if (kws.length === 0) {
     return send(chatId,
       `У вас пока нет ключевых слов.\n\nНажмите "➕ Добавить слово" чтобы начать отслеживать тендеры.`,
@@ -728,7 +719,7 @@ async function handleKeywordInput(chatId, text) {
     return send(chatId, `Слово слишком короткое. Минимум 2 символа.`, mainMenu());
   }
 
-  const added = addKeywordToList(chatId, keyword);
+  const added = await addKeywordToList(chatId, keyword);
   if (!added) {
     return send(chatId, `Слово "${sanitize(keyword)}" уже есть в вашем списке.`, mainMenu());
   }
@@ -737,7 +728,7 @@ async function handleKeywordInput(chatId, text) {
     await deductChars(stateData.accessId, ACTION_COST.add_keyword, 'add_keyword', chatId);
   }
 
-  const kws = getKeywords(chatId);
+  const kws = await getKeywords(chatId);
   await send(chatId,
     `Добавлено: *${sanitize(keyword)}*\n\n` +
     `Ваши слова (${kws.length}): ${kws.join(", ")}\n\n` +
@@ -751,7 +742,7 @@ async function handleSearch(chatId) {
   const access = await requireAccess(chatId, 'search');
   if (!access) return;
 
-  const kws = getKeywords(chatId);
+  const kws = await getKeywords(chatId);
   if (kws.length === 0) {
     return send(chatId,
       `Сначала добавьте ключевые слова.\n\nНажмите "➕ Добавить слово"`,
@@ -776,7 +767,7 @@ async function handleSearch(chatId) {
   if (LIVE_MODE && liveFailed) {
     return send(chatId, `❌ Временная ошибка live API госзакуп. Повторите через 1-2 минуты.`, mainMenu());
   }
-  const finalResults = applyTenderFilters(LIVE_MODE ? liveResults : results, getFilters(chatId));
+  const finalResults = applyTenderFilters(LIVE_MODE ? liveResults : results, await getFilters(chatId));
   if (finalResults.length === 0) {
     await deductChars(access.id, ACTION_COST.search, 'search', chatId);
     return send(chatId,
@@ -825,7 +816,7 @@ async function handleLatest(chatId) {
   } else {
     latest = MOCK_TENDERS.slice(0, 5);
   }
-  const filteredLatest = applyTenderFilters(latest.map(t => ({ tender: t, matchedKeywords: [] })), getFilters(chatId)).map(r => r.tender);
+  const filteredLatest = applyTenderFilters(latest.map(t => ({ tender: t, matchedKeywords: [] })), await getFilters(chatId)).map(r => r.tender);
   for (const tender of filteredLatest) {
     await send(chatId, formatTender(tender));
   }
@@ -860,7 +851,7 @@ async function handleAbout(chatId) {
 }
 
 async function handleDeleteKeyword(chatId, keyword) {
-  const removed = removeKeywordFromList(chatId, keyword);
+  const removed = await removeKeywordFromList(chatId, keyword);
   if (removed) {
     await send(chatId, `Удалено: "${sanitize(keyword)}"`, mainMenu());
   } else {
