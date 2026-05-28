@@ -18,7 +18,8 @@ import {
   getPendingSocialActions, approveSocialAction, rejectSocialAction,
   getStats,
   getUserKeywords, addUserKeyword, removeUserKeyword,
-  getUserFilters, setUserFilters, clearUserFilters
+  getUserFilters, setUserFilters, clearUserFilters,
+  saveSearchCache, getSearchCache, advanceSearchOffset
 } from '../lib/tender-db.js';
 
 // All env reads use .trim() — prod env-vars were saved with literal "\n"
@@ -792,7 +793,8 @@ async function handleSearch(chatId) {
       return send(chatId, `❌ Live-режим включён, но не настроен TENDER_GQL_TOKEN. Обратитесь к администратору.`, mainMenu());
     }
     try {
-      liveResults = await searchLiveByKeywords(kws, 10);
+      // Fetch more than 5 so "Show more" pagination has something to show.
+      liveResults = await searchLiveByKeywords(kws, 30);
     } catch (e) {
       liveFailed = true;
       liveResults = [];
@@ -814,6 +816,9 @@ async function handleSearch(chatId) {
   await deductChars(access.id, ACTION_COST.search, 'search', chatId);
   const remaining = await getActiveAccess(chatId);
 
+  // Cache full result set for pagination (TTL 30 min in DB).
+  await saveSearchCache(chatId, finalResults);
+
   await send(chatId,
     `*Найдено ${finalResults.length} тендеров* по словам: ${kws.join(", ")}\n` +
     (remaining ? `_Осталось символов: ${remaining.remaining_chars}_` : ''),
@@ -825,7 +830,52 @@ async function handleSearch(chatId) {
   }
 
   if (finalResults.length > 5) {
-    await send(chatId, `...и ещё ${finalResults.length - 5} тендеров. В полной версии — все результаты.`, mainMenu());
+    await send(chatId,
+      `📄 Показано 5 из ${finalResults.length}.`,
+      {
+        reply_markup: {
+          inline_keyboard: [[
+            { text: `👀 Показать ещё (${Math.min(5, finalResults.length - 5)})`, callback_data: "search:more" }
+          ]],
+        },
+      }
+    );
+  }
+}
+
+async function handleSearchMore(chatId) {
+  const cache = await getSearchCache(chatId);
+  if (!cache) {
+    return send(chatId, `⏰ Нет сохранённых результатов. Запустите поиск заново.`, mainMenu());
+  }
+  if (!cache.fresh) {
+    return send(chatId, `⏰ Результаты устарели (>30 мин). Запустите поиск заново.`, mainMenu());
+  }
+  const start = cache.offset_idx;
+  const slice = cache.results.slice(start, start + 5);
+  if (slice.length === 0) {
+    return send(chatId, `✅ Вы пролистали все результаты.`, mainMenu());
+  }
+
+  for (const { tender, matchedKeywords } of slice) {
+    await send(chatId, formatTender(tender, matchedKeywords));
+  }
+
+  const newOffset = await advanceSearchOffset(chatId, slice.length);
+  const remaining = Math.max(0, cache.results.length - newOffset);
+  if (remaining > 0) {
+    await send(chatId,
+      `📄 Показано ${newOffset} из ${cache.results.length}.`,
+      {
+        reply_markup: {
+          inline_keyboard: [[
+            { text: `👀 Показать ещё (${Math.min(5, remaining)})`, callback_data: "search:more" }
+          ]],
+        },
+      }
+    );
+  } else {
+    await send(chatId, `✅ Это были последние ${slice.length} результатов.`, mainMenu());
   }
 }
 
@@ -1206,6 +1256,8 @@ export default async function handler(req, res) {
 
       if (d.startsWith("del:")) {
         await handleDeleteKeyword(chatId, d.slice(4));
+      } else if (d === "search:more") {
+        await handleSearchMore(chatId);
       } else if (d === "reward:channel") {
         await handleChannelReward(chatId);
       } else if (d === "reward:check_channels") {
