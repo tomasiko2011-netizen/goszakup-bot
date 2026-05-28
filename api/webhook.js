@@ -979,27 +979,15 @@ async function handleSocialReward(chatId, platform) {
     youtube: 'https://www.youtube.com/@monkeybot'
   };
 
-  const result = await claimSocialAction(chatId, platform);
-  if (result.duplicate) {
-    const action = result.action;
-    if (action.status === 'cooldown') {
-      const timeLeft = Math.max(0, Math.round((new Date(action.eligible_at) - Date.now()) / 60000));
-      await send(chatId,
-        `⏳ Ваша заявка на проверке. Осталось ~${timeLeft} мин.\n` +
-        `Доступ будет выдан автоматически.`
-      );
-    } else {
-      await send(chatId, `У вас уже есть заявка на ${labels[platform]}. Попробуйте другое задание.`);
-    }
-    return;
-  }
-
+  // Show task instructions; the actual pending claim is created when
+  // user clicks "Я выполнил" (handleSocialDone). This avoids creating
+  // ghost pending records for users who never finish.
   await send(chatId,
     `🎬 *Задание ${labels[platform]}:*\n\n` +
     `1. Перейдите по ссылке: ${links[platform]}\n` +
     `2. Подпишитесь и поставьте лайк\n` +
-    `3. Нажмите кнопку ниже\n\n` +
-    `_Доступ будет выдан через 5 минут автоматически._`,
+    `3. Нажмите кнопку ниже — заявка уйдёт админу на проверку\n\n` +
+    `_Доступ выдаётся после ручной проверки._`,
     {
       reply_markup: {
         inline_keyboard: [
@@ -1011,15 +999,40 @@ async function handleSocialReward(chatId, platform) {
   );
 }
 
-async function handleSocialDone(chatId, platform) {
+async function handleSocialDone(chatId, platform, from = {}) {
   const labels = { tiktok: 'TikTok', youtube: 'YouTube' };
+
+  const result = await claimSocialAction(chatId, platform);
+  if (result.duplicate) {
+    return send(chatId,
+      `⏳ У вас уже есть заявка на ${labels[platform]} на проверке. Дождитесь решения админа.`
+    );
+  }
+
   await send(chatId,
-    `⏳ Принято! Доступ к ${labels[platform]} будет проверен через 5 минут.\n` +
-    `Отправьте любое сообщение после этого для активации.`
+    `📨 Заявка на ${labels[platform]} отправлена админу. После одобрения вы получите доступ на 24 часа.`
   );
-  await notifyAdmin(
-    `🔔 Социальное задание: пользователь ${chatId} заявил выполнение ${platform}. Spot-check при необходимости.`
-  );
+
+  const adminId = ADMIN_ID();
+  if (!adminId) return;
+  const username = from.username ? `@${sanitize(from.username, 30)}` : '(нет username)';
+  const firstName = sanitize(from.first_name || '', 30);
+  await send(adminId,
+    `🔔 *Соц.задание на проверке*\n\n` +
+    `Платформа: *${labels[platform]}*\n` +
+    `Пользователь: ${username} ${firstName}\n` +
+    `Chat ID: \`${chatId}\``,
+    {
+      reply_markup: {
+        inline_keyboard: [
+          [
+            { text: "✅ Одобрить", callback_data: `admin:approve:${result.action.id}` },
+            { text: "❌ Отклонить", callback_data: `admin:reject:${result.action.id}` },
+          ],
+        ],
+      },
+    }
+  ).catch(() => {});
 }
 
 async function handleReferralReward(chatId) {
@@ -1173,7 +1186,7 @@ export default async function handler(req, res) {
       } else if (d === "reward:social:youtube") {
         await handleSocialReward(chatId, 'youtube');
       } else if (d.startsWith("reward:social_done:")) {
-        await handleSocialDone(chatId, d.split(':')[2]);
+        await handleSocialDone(chatId, d.split(':')[2], q.from || {});
       } else if (d === "reward:referral") {
         await handleReferralReward(chatId);
       } else if (d === "reward:status") {
@@ -1185,13 +1198,25 @@ export default async function handler(req, res) {
           if (result) {
             await editMessage(chatId, q.message.message_id,
               `✅ Одобрено: ${result.platform} для ${result.telegram_id}`);
+            // Notify the user that they got access
+            await send(result.telegram_id,
+              `✅ *Доступ выдан!* Задание ${result.platform} одобрено админом.\n` +
+              `24 часа + 1000 символов начислены — можно искать тендеры.`,
+              mainMenu()
+            ).catch(() => {});
           }
         }
       } else if (d.startsWith("admin:reject:")) {
         if (isAdminUser(chatId) || await dbIsAdmin(chatId)) {
           const actionId = parseInt(d.split(':')[2], 10);
-          await rejectSocialAction(actionId);
+          const result = await rejectSocialAction(actionId);
           await editMessage(chatId, q.message.message_id, `❌ Отклонено.`);
+          if (result?.telegram_id) {
+            await send(result.telegram_id,
+              `❌ Ваша заявка на ${result.platform} отклонена админом. Попробуйте другое задание.`,
+              mainMenu()
+            ).catch(() => {});
+          }
         }
       }
 
