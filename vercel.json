@@ -1,1 +1,12 @@
-{"functions":{"api/webhook.js":{"maxDuration":45}},"rewrites":[{"source":"/","destination":"/index.html"}]}
+{
+  "functions": {
+    "api/webhook.js": { "maxDuration": 45 },
+    "api/cron-poll.js": { "maxDuration": 60 }
+  },
+  "rewrites": [
+    { "source": "/", "destination": "/index.html" }
+  ],
+  "crons": [
+    { "path": "/api/cron-poll", "schedule": "*/30 * * * *" }
+  ]
+}
