@@ -439,13 +439,42 @@ function formatAmount(amount) {
 }
 
 // --- Tender card formatter ---
+function highlightKeywords(text, keywords) {
+  if (!text || !keywords?.length) return text || "";
+  let out = String(text);
+  // Sort keywords by length desc so longer phrases match before parts of them
+  const sorted = [...keywords].sort((a, b) => b.length - a.length);
+  for (const kw of sorted) {
+    if (!kw) continue;
+    const escaped = kw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    out = out.replace(new RegExp(`(${escaped})`, 'gi'), '*$1*');
+  }
+  return out;
+}
+
 function formatTender(tender, matchedKeywords) {
+  const kws = matchedKeywords || [];
   let card = `📋 *${tender.title}*\n`;
-  card += `💰 Сумма: ${formatAmount(tender.amount)} ₸\n`;
+  // Show lot name if it differs from tender title (often more specific category)
+  if (tender.lotName && tender.lotName !== tender.title) {
+    card += `📦 Лот: ${highlightKeywords(tender.lotName, kws)}\n`;
+  }
+  // Show description (where the substring match usually lives)
+  if (tender.description) {
+    const desc = tender.description.length > 200
+      ? tender.description.slice(0, 200) + "…"
+      : tender.description;
+    card += `📝 ${highlightKeywords(desc, kws)}\n`;
+  }
+  card += `💰 Сумма: ${formatAmount(tender.amount)} ₸`;
+  if (tender.lotAmount && tender.lotAmount !== tender.amount) {
+    card += ` (лот: ${formatAmount(tender.lotAmount)} ₸)`;
+  }
+  card += `\n`;
   card += `🏢 Заказчик: ${tender.customer}\n`;
   card += `📅 Дедлайн: ${tender.deadline}\n`;
-  if (matchedKeywords && matchedKeywords.length > 0) {
-    card += `🔑 Совпадение: ${matchedKeywords.map(k => `"${k}"`).join(", ")}\n`;
+  if (kws.length > 0) {
+    card += `🔑 Совпадение: ${kws.map(k => `"${k}"`).join(", ")}\n`;
   }
   card += `🔗 ${tender.url}`;
   return card;
