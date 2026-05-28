@@ -272,10 +272,26 @@ async function fetchLatestLive(limit = 5) {
   }
 }
 
-function buildCamelQuery(filterField) {
-  return `
-    query SearchTrdBuy($q: String, $limit: Int) {
-      TrdBuy(limit: $limit, after: 0, filter: { ${filterField}: $q }) {
+// Query Lots with nameDescriptionRu — this is THE substring filter
+// (works on name + description, with Russian morphology / case-insensitive).
+// nameDescriptionRu does NOT exist on TrdBuyFiltersInput, only on LotsFiltersInput.
+// Each lot carries an inline TrdBuy reference, so we get the parent tender card
+// in a single round-trip.
+const LOTS_SEARCH_QUERY = `
+  query SearchLots($q: String, $limit: Int) {
+    Lots(limit: $limit, filter: { nameDescriptionRu: $q }) {
+      id
+      lotNumber
+      nameRu
+      nameKz
+      descriptionRu
+      amount
+      count
+      customerBin
+      customerNameRu
+      customerNameKz
+      trdBuyId
+      TrdBuy {
         id
         nameRu
         nameKz
@@ -292,83 +308,59 @@ function buildCamelQuery(filterField) {
         endDate
       }
     }
-  `;
-}
+  }
+`;
 
-function buildSnakeQuery(filterField) {
-  return `
-    query SearchTrdBuy($q: String, $limit: Int) {
-      trd_buy(limit: $limit, after: 0, filters: { ${filterField}: $q }) {
-        id
-        name_ru
-        name_kz
-        total_sum
-        start_date
-        customer_name_ru
-        customer_name_kz
-        customer_bin
-        org_name_ru
-        org_name_kz
-        org_bin
-        kato
-        publish_date
-        end_date
-      }
-    }
-  `;
-}
-
-function mapSnakeTender(t) {
-  return normalizeTrdBuy({
-    id: t.id,
-    nameRu: t.name_ru,
-    nameKz: t.name_kz,
-    totalSum: t.total_sum,
-    startDate: t.start_date,
-    customerNameRu: t.customer_name_ru,
-    customerNameKz: t.customer_name_kz,
-    customerBin: t.customer_bin,
-    orgNameRu: t.org_name_ru,
-    orgNameKz: t.org_name_kz,
-    orgBin: t.org_bin,
-    kato: t.kato,
-    publishDate: t.publish_date,
-    endDate: t.end_date,
-  });
+// Normalize a Lot (with its inline TrdBuy) into the existing tender card shape.
+// Falls back to lot fields if TrdBuy is missing.
+function normalizeLot(lot) {
+  const t = lot.TrdBuy || {};
+  const customerName =
+    lot.customerNameRu || lot.customerNameKz ||
+    t.customerNameRu  || t.customerNameKz  ||
+    t.orgNameRu       || t.orgNameKz       ||
+    "Заказчик не указан";
+  const customerBin = lot.customerBin || t.customerBin || t.orgBin || "";
+  const tenderId = t.id || lot.trdBuyId || lot.id;
+  return {
+    id: String(tenderId),
+    lotId: String(lot.id || ""),
+    lotNumber: lot.lotNumber || "",
+    title: t.nameRu || lot.nameRu || t.nameKz || lot.nameKz || "Без названия",
+    lotName: lot.nameRu || lot.nameKz || "",
+    description: lot.descriptionRu || "",
+    amount: Number(t.totalSum || lot.amount || 0),
+    lotAmount: Number(lot.amount || 0),
+    customer: customerBin ? `${customerName} (БИН: ${customerBin})` : customerName,
+    deadline: t.endDate || t.publishDate || "",
+    startDate: t.startDate || "",
+    publishDate: t.publishDate || "",
+    kato: t.kato || "",
+    keywords: [],
+    url: tenderId ? `https://goszakup.gov.kz/ru/announce/index/${tenderId}` : "",
+  };
 }
 
 async function fetchByKeyword(kw, perKwLimit) {
-  // Try substring filter (nameDescriptionRu) first, then exact (nameRu),
-  // each with camelCase + snake_case fallback. Return raw matches; caller verifies.
-  const attempts = [
-    { query: buildCamelQuery('nameDescriptionRu'), root: 'TrdBuy', snake: false },
-    { query: buildCamelQuery('nameRu'),            root: 'TrdBuy', snake: false },
-    { query: buildSnakeQuery('name_description_ru'), root: 'trd_buy', snake: true },
-    { query: buildSnakeQuery('name_ru'),             root: 'trd_buy', snake: true },
-  ];
-  for (const a of attempts) {
-    try {
-      const data = await gqlRequest(a.query, { q: kw, limit: perKwLimit });
-      const items = data?.[a.root] || [];
-      if (items.length === 0) continue;
-      return a.snake ? items.map(mapSnakeTender) : items.map(normalizeTrdBuy);
-    } catch (_) {
-      continue;
-    }
+  try {
+    const data = await gqlRequest(LOTS_SEARCH_QUERY, { q: kw, limit: perKwLimit });
+    const lots = data?.Lots || [];
+    return lots.map(normalizeLot);
+  } catch (_) {
+    return [];
   }
-  return [];
 }
 
 async function searchLiveByKeywords(keywords, limit = 10) {
-  // Server-side filter per keyword (parallel), merge by tender id,
-  // verify locally (substring), graceful failure per keyword.
+  // Per-keyword Lots search (parallel), group by parent tender id,
+  // verify locally (substring against title+description+customer+lotName).
   const normKeywords = keywords
     .map(k => String(k || "").toLowerCase().trim())
     .filter(Boolean);
   if (normKeywords.length === 0) return [];
 
   const perKwLimit = Math.max(10, Math.min(50, limit * 5));
-  const byId = new Map(); // id -> { tender, matchedKeywords: Set<string> }
+  const byId = new Map(); // tenderId -> { tender, matchedKeywords: Set<string> }
   let anySucceeded = false;
 
   const results = await Promise.allSettled(
@@ -380,8 +372,8 @@ async function searchLiveByKeywords(keywords, limit = 10) {
     anySucceeded = true;
     const { kw, items } = r.value;
     for (const tender of items) {
-      const hay = `${tender.title || ""} ${tender.customer || ""}`.toLowerCase();
-      if (!hay.includes(kw)) continue; // local verification
+      const hay = `${tender.title || ""} ${tender.lotName || ""} ${tender.description || ""} ${tender.customer || ""}`.toLowerCase();
+      if (!hay.includes(kw)) continue; // local verification (defensive — server-side already filtered)
       const existing = byId.get(tender.id);
       if (existing) {
         existing.matchedKeywords.add(kw);
