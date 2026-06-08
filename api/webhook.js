@@ -279,8 +279,8 @@ async function fetchLatestLive(limit = 5) {
 // Each lot carries an inline TrdBuy reference, so we get the parent tender card
 // in a single round-trip.
 const LOTS_SEARCH_QUERY = `
-  query SearchLots($q: String, $limit: Int) {
-    Lots(limit: $limit, filter: { nameDescriptionRu: $q }) {
+  query SearchLots($q: String, $limit: Int, $updatedAfter: [String]) {
+    Lots(limit: $limit, filter: { nameDescriptionRu: $q, lastUpdateDate: $updatedAfter }) {
       id
       lotNumber
       nameRu
@@ -342,13 +342,27 @@ function normalizeLot(lot) {
   };
 }
 
+// goszakup returns Lots ascending by id (no `sort` arg), so an unfiltered search
+// drowns in years-old closed lots. Constrain to a recent lastUpdateDate window
+// to surface currently-relevant tenders. Returns ["YYYY-MM-DD", "YYYY-MM-DD"].
+function recentWindow(days = 180) {
+  const fmt = (ms) => new Date(ms).toISOString().slice(0, 10);
+  return [fmt(Date.now() - days * 86400000), fmt(Date.now())];
+}
+
 async function fetchByKeyword(kw, perKwLimit) {
   try {
-    const data = await gqlRequest(LOTS_SEARCH_QUERY, { q: kw, limit: perKwLimit });
-    const lots = data?.Lots || [];
-    return lots.map(normalizeLot);
+    const data = await gqlRequest(LOTS_SEARCH_QUERY, { q: kw, limit: perKwLimit, updatedAfter: recentWindow() });
+    return (data?.Lots || []).map(normalizeLot);
   } catch (_) {
-    return [];
+    // Date-filter format may be unsupported on this endpoint — degrade gracefully
+    // to the unfiltered query (previous behavior) rather than failing the search.
+    try {
+      const data = await gqlRequest(LOTS_SEARCH_QUERY, { q: kw, limit: perKwLimit, updatedAfter: null });
+      return (data?.Lots || []).map(normalizeLot);
+    } catch (_) {
+      return [];
+    }
   }
 }
 
@@ -387,6 +401,7 @@ async function searchLiveByKeywords(keywords, limit = 10) {
   if (!anySucceeded) throw new Error("all_keyword_queries_failed");
 
   return Array.from(byId.values())
+    .sort((a, b) => Number(b.tender.lotId || b.tender.id) - Number(a.tender.lotId || a.tender.id))
     .slice(0, limit)
     .map(({ tender, matchedKeywords }) => ({
       tender,
