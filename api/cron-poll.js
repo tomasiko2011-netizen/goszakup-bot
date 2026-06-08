@@ -3,9 +3,11 @@
  * keywords and pushes Telegram notifications.
  *
  * Triggered by Vercel Cron (configured in vercel.json). Iterates over every
- * user that has saved keywords; for each (user, keyword) pair, fetches the
- * newest 10 Lots via GraphQL Lots(filter:{nameDescriptionRu: kw}, sort:{id:DESC})
- * and notifies the user about lots whose id > last_seen_lot_id.
+ * user that has saved keywords; for each (user, keyword) pair it pages the
+ * goszakup GraphQL Lots cursor. NOTE: the Lots query has NO `sort` argument —
+ * results come back ascending by id and you paginate with `after: <last id>`.
+ * So we pass `after: last_seen_lot_id`, which returns exactly the lots whose id
+ * is greater than what we last notified, and push those to the user.
  *
  * Auth: Vercel Cron sets `Authorization: Bearer <CRON_SECRET>` if CRON_SECRET
  * env var is set on the project. If not set, accepts any caller (handy in dev).
@@ -23,8 +25,8 @@ const BOT_TOKEN = (process.env.TENDER_DEMO_TOKEN || "").trim();
 const CRON_SECRET = (process.env.CRON_SECRET || "").trim();
 
 const NEW_LOTS_QUERY = `
-  query NewLots($q: String, $limit: Int) {
-    Lots(limit: $limit, filter: { nameDescriptionRu: $q }) {
+  query NewLots($q: String, $limit: Int, $after: Int) {
+    Lots(limit: $limit, after: $after, filter: { nameDescriptionRu: $q }) {
       id
       lotNumber
       nameRu
@@ -68,6 +70,30 @@ async function gqlRequest(query, variables, timeoutMs = 10000) {
   } finally {
     clearTimeout(timeout);
   }
+}
+
+// goszakup Lots cursor is ascending by id, paged via `after: <last id>`.
+const PAGE_SIZE = 200;          // goszakup max page size
+const MAX_NEW_PAGES = 5;        // steady-state: cap pages of new lots scanned per run
+const MAX_BASELINE_PAGES = 25;  // first-run high-water mark search (safety-capped)
+
+// Page the Lots cursor starting strictly after `afterId`.
+// Returns { lots, maxId, capped }: lots = everything with id > afterId we fetched
+// (ascending), maxId = highest id seen (>= afterId), capped = hit the page cap.
+async function pageLotsAfter(kw, afterId, maxPages) {
+  const lots = [];
+  let cursor = afterId;
+  let capped = false;
+  for (let p = 0; p < maxPages; p++) {
+    const data = await gqlRequest(NEW_LOTS_QUERY, { q: kw, limit: PAGE_SIZE, after: cursor });
+    const batch = data?.Lots || [];
+    if (batch.length === 0) break;
+    lots.push(...batch);
+    cursor = Math.max(cursor, ...batch.map(l => Number(l.id)));
+    if (batch.length < PAGE_SIZE) break;
+    if (p === maxPages - 1) capped = true;
+  }
+  return { lots, maxId: cursor, capped };
 }
 
 async function tgSend(chatId, text, extra = {}) {
@@ -137,7 +163,6 @@ export default async function handler(req, res) {
   const startedAt = Date.now();
   const stats = { users: 0, keywords: 0, fetched: 0, notifications: 0, errors: 0 };
   const MAX_NOTIFY_PER_KEYWORD = 3; // cap to avoid flooding a user when many new lots appear
-  const PER_KW_LIMIT = 10;
 
   try {
     const users = await getUsersWithKeywords();
@@ -150,23 +175,23 @@ export default async function handler(req, res) {
         stats.keywords++;
         try {
           const lastSeen = await getLastSeen(tgId, kw);
-          const data = await gqlRequest(NEW_LOTS_QUERY, { q: kw, limit: PER_KW_LIMIT });
-          const lots = (data?.Lots || []).filter(l => Number(l.id) > lastSeen);
-          stats.fetched += lots.length;
-          if (lots.length === 0) {
-            // Initial baseline — record the highest id we saw so we don't
-            // dump the entire history on first run.
-            if (lastSeen === 0 && data?.Lots?.length) {
-              const maxId = Math.max(...data.Lots.map(l => Number(l.id)));
-              await setLastSeen(tgId, kw, maxId);
-            }
+
+          // First run for this keyword: establish the high-water mark by paging
+          // to the newest id, and notify nothing — otherwise we'd dump history.
+          if (lastSeen === 0) {
+            const { maxId } = await pageLotsAfter(kw, 0, MAX_BASELINE_PAGES);
+            if (maxId > 0) await setLastSeen(tgId, kw, maxId);
             continue;
           }
 
-          // Sort newest first, cap and send
+          // Steady state: the cursor returns exactly id > lastSeen (the new lots).
+          const { lots, maxId } = await pageLotsAfter(kw, lastSeen, MAX_NEW_PAGES);
+          stats.fetched += lots.length;
+          if (lots.length === 0) continue;
+
+          // Newest first for display, cap how many we push
           lots.sort((a, b) => Number(b.id) - Number(a.id));
           const toSend = lots.slice(0, MAX_NOTIFY_PER_KEYWORD);
-          const maxId = Math.max(...lots.map(l => Number(l.id)));
 
           for (const lot of toSend) {
             const card = formatLotCard(lot, kw);
