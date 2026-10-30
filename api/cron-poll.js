@@ -147,9 +147,9 @@ function formatLotCard(lot, keyword) {
 
 export default async function handler(req, res) {
   // Cron auth: Vercel sets Authorization: Bearer <CRON_SECRET>
-  if (CRON_SECRET) {
+  {
     const authHeader = req.headers.authorization || "";
-    if (authHeader !== `Bearer ${CRON_SECRET}`) {
+    if (!CRON_SECRET || authHeader !== `Bearer ${CRON_SECRET}`) {
       return res.status(401).json({ error: "Unauthorized" });
     }
   }
